@@ -1,24 +1,40 @@
 use std::mem;
 use std::panic::RefUnwindSafe;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Sub};
+use std::num::Wrapping;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub trait IntCast : Copy + Eq + Add<Output=Self> + BitAnd<Output=Self>
     + BitOr<Output=Self> + BitXor<Output=Self> + Sub<Output=Self> {
+    type Public: PartialEq + Copy;
+
     fn from(u: usize) -> Self;
     fn to(self) -> usize;
+
+    fn new(p: Self::Public) -> Self;
+    fn unwrap(self) -> Self::Public;
 }
 
 macro_rules! intcast {
     ($($type:ident)+) => {
         $(
-            impl IntCast for $type {
+            impl IntCast for Wrapping<$type> {
+                type Public = $type;
+
                 fn from(u: usize) -> Self {
-                    u as Self
+                    Wrapping(u as $type)
                 }
                 fn to(self) -> usize {
-                    self as usize
+                    self.0 as usize
+                }
+
+                fn new(p: $type) -> Self {
+                    Wrapping(p)
+                }
+
+                fn unwrap(self) -> $type {
+                    self.0
                 }
             }
         )+
@@ -32,7 +48,7 @@ pub struct Template<T> {
 
 impl<T: Default + IntCast> Default for Template<T> {
     fn default() -> Self {
-        Self::new(Default::default())
+        Self::new(T::default().unwrap())
     }
 }
 
@@ -70,44 +86,44 @@ impl<T: IntCast> Template<T> {
 
     // TODO: make this const if const is stable first
     #[inline]
-    pub /*const*/ fn new(v: T) -> Self {
-        Template { v: UnsafeCell::new(v) }
+    pub /*const*/ fn new(v: T::Public) -> Self {
+        Template { v: UnsafeCell::new(T::new(v)) }
     }
 
     #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.v.get() }
+    pub fn get_mut(&mut self) -> &mut T::Public {
+        unsafe { &mut *(self.v.get() as *mut T::Public) }
     }
 
     #[inline]
-    pub fn into_inner(self) -> T {
-        unsafe { self.v.into_inner() }
+    pub fn into_inner(self) -> T::Public {
+        unsafe { self.v.into_inner() }.unwrap()
     }
 
     #[inline]
-    pub fn load(&self, order: Ordering) -> T {
+    pub fn load(&self, order: Ordering) -> T::Public {
         let (p, o) = self.proxy();
-        IntCast::from(p.load(order) >> o)
+        T::from(p.load(order) >> o).unwrap()
     }
 
     #[inline]
-    fn op<F: Fn(T) -> Option<T>>(&self, f: F, order: Ordering) -> T {
+    fn op<F: Fn(T) -> Option<T>>(&self, f: F, order: Ordering) -> T::Public {
         self.op_new(f, order, strongest_failure_ordering(order))
     }
 
     #[inline]
-    fn op_new<F: Fn(T) -> Option<T>>(&self, f: F, success: Ordering, failure: Ordering) -> T {
+    fn op_new<F: Fn(T) -> Option<T>>(&self, f: F, success: Ordering, failure: Ordering) -> T::Public {
         let (p, o) = self.proxy();
         let mut old = p.load(Ordering::Relaxed);
         loop {
-            let old_t = IntCast::from(old >> o);
+            let old_t = T::from(old >> o);
             let new_t = match f(old_t) {
                 Some(x) => x,
-                None => return old_t,
+                None => return old_t.unwrap(),
             };
 
             match Self::op_weak(p, o, old, new_t, success, failure) {
-                Ok(()) => return IntCast::from(old >> o),
+                Ok(()) => return T::from(old >> o).unwrap(),
                 Err(prev) => old = prev,
             };
         }
@@ -120,74 +136,74 @@ impl<T: IntCast> Template<T> {
     }
     
     #[inline]
-    pub fn store(&self, val: T, order: Ordering) {
-        self.op(|_| Some(val), order);
+    pub fn store(&self, val: T::Public, order: Ordering) {
+        self.op(|_| Some(T::new(val)), order);
     }
 
     #[inline]
-    pub fn swap(&self, val: T, order: Ordering) -> T {
-        self.op(|_| Some(val), order)
+    pub fn swap(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|_| Some(T::new(val)), order)
     }
 
     #[inline]
-    pub fn compare_and_swap(&self, current: T, new: T, order: Ordering) -> T {
-        self.op(|x| if x == current { Some(new) } else { None }, order)
+    pub fn compare_and_swap(&self, current: T::Public, new: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| if x == T::new(current) { Some(T::new(new)) } else { None }, order)
     }
 
     #[inline]
-    pub fn compare_exchange(&self, current: T, new: T, success: Ordering, failure: Ordering) -> Result<T, T> {
-        match self.op_new(|x| if x == current { Some(new) } else { None }, success, failure) {
+    pub fn compare_exchange(&self, current: T::Public, new: T::Public, success: Ordering, failure: Ordering) -> Result<T::Public, T::Public> {
+        match self.op_new(|x| if x == T::new(current) { Some(T::new(new)) } else { None }, success, failure) {
             x if x == current => Ok(x),
             x => Err(x),
         }
     }
 
     #[inline]
-    pub fn compare_exchange_weak(&self, current: T, new: T, success: Ordering, failure: Ordering) -> Result<T, T> {
+    pub fn compare_exchange_weak(&self, current: T::Public, new: T::Public, success: Ordering, failure: Ordering) -> Result<T::Public, T::Public> {
         let (p, o) = self.proxy();
         let old = p.load(Ordering::Relaxed);
-        let old_t = IntCast::from(old >> o);
+        let old_t = T::from(old >> o).unwrap();
         if old_t != current {
             return Err(old_t);
         }
 
-        Self::op_weak(p, o, old, new, success, failure).map(|()| current).map_err(|x| IntCast::from(x >> o))
+        Self::op_weak(p, o, old, T::new(new), success, failure).map(|()| current).map_err(|x| T::from(x >> o).unwrap())
     }
 
     #[inline]
-    pub fn fetch_add(&self, val: T, order: Ordering) -> T {
-        self.op(|x| Some(x + val), order)
+    pub fn fetch_add(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| Some(x + T::new(val)), order)
     }
 
     #[inline]
-    pub fn fetch_sub(&self, val: T, order: Ordering) -> T {
-        self.op(|x| Some(x - val), order)
+    pub fn fetch_sub(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| Some(x - T::new(val)), order)
     }
 
     #[inline]
-    pub fn fetch_and(&self, val: T, order: Ordering) -> T {
-        self.op(|x| Some(x & val), order)
+    pub fn fetch_and(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| Some(x & T::new(val)), order)
     }
 
     #[inline]
-    pub fn fetch_or(&self, val: T, order: Ordering) -> T {
-        self.op(|x| Some(x | val), order)
+    pub fn fetch_or(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| Some(x | T::new(val)), order)
     }
 
     #[inline]
-    pub fn fetch_xor(&self, val: T, order: Ordering) -> T {
-        self.op(|x| Some(x ^ val), order)
+    pub fn fetch_xor(&self, val: T::Public, order: Ordering) -> T::Public {
+        self.op(|x| Some(x ^ T::new(val)), order)
     }
 }
 
-pub type AtomicI8 = Template<i8>;
-pub type AtomicU8 = Template<u8>;
-pub type AtomicI16 = Template<i16>;
-pub type AtomicU16 = Template<u16>;
-pub type AtomicI32 = Template<i32>;
-pub type AtomicU32 = Template<u32>;
-pub type AtomicI64 = Template<i64>;
-pub type AtomicU64 = Template<u64>;
+pub type AtomicI8 = Template<Wrapping<i8>>;
+pub type AtomicU8 = Template<Wrapping<u8>>;
+pub type AtomicI16 = Template<Wrapping<i16>>;
+pub type AtomicU16 = Template<Wrapping<u16>>;
+pub type AtomicI32 = Template<Wrapping<i32>>;
+pub type AtomicU32 = Template<Wrapping<u32>>;
+pub type AtomicI64 = Template<Wrapping<i64>>;
+pub type AtomicU64 = Template<Wrapping<u64>>;
 
 
 #[cfg(test)]

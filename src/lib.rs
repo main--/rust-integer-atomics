@@ -5,6 +5,8 @@
 //!
 //! Otherwise, they are emulated with the existing stable `AtomicUsize` and compare-exchange loops.
 //! Because of that, the `Atomic{U,I}64` types are only available on 64-bit platforms.
+//! Also, this is obviously much slower than real atomics. This is only a stopgap solution until
+//! those are finally stabilized.
 //!
 //! This crate has no documentation as these types are documented within the standard library docs.
 
