@@ -4,6 +4,7 @@ description = "This crate allows you to compile code that needs the unstable int
 version = "1.0.1"
 license = "MIT"
 authors = ["main() <main@ehvag.de>"]
+repository = "https://github.com/main--/rust-integer-atomics"
 
 [features]
 nightly = []
